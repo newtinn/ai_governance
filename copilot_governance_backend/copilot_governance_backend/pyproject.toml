@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "copilot-governance-backend"
+version = "0.1.0"
+description = ""
+authors = ["Matt Newton <newtinn@hotmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = {extras = ["standard"], version = "^0.115.8"}
+azure-mgmt-resource = "^23.2.0"
+azure-identity = "^1.19.0"
+python-dotenv = "^1.0.1"
+azure-mgmt-rdbms = "^10.1.0"
+mysql-connector-python = "^9.2.0"
+psycopg2-binary = "^2.9.10"
+sqlalchemy = "^2.0.37"
+azure-mgmt-consumption = "^10.0.0"
+azure-mgmt-storage = "^22.0.0"
+azure-ai-ml = "^1.24.0"
+openai = "^1.61.1"
+azure-mgmt-cognitiveservices = "^13.6.0"
+azure-storage-blob = "^12.24.1"
+azureml = "^0.2.7"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
