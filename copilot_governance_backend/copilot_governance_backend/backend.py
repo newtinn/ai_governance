@@ -1,8 +1,9 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from io import BytesIO
 
-import os
 from azure.identity import AzureCliCredential
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.consumption import ConsumptionManagementClient
@@ -12,19 +13,22 @@ from azure.ai.ml import MLClient
 from azure.ai.ml.entities import Workspace
 from azure.mgmt.cognitiveservices import CognitiveServicesManagementClient
 from azure.mgmt.cognitiveservices.models import Account, Sku, Deployment, DeploymentModel, DeploymentProperties
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, BlobClient
 from azure.core.polling import LROPoller
 from azure.core.exceptions import HttpResponseError
 from openai import AzureOpenAI
 
 from azure.core.exceptions import ResourceExistsError
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import os
 
-from models import Agent, Base
+from models import Agent, KnowledgeSource, AgentKnowledgeSource, Base
 from database import engine, get_db
 from sqlalchemy.orm import Session
+from schemas import KnowledgeSourceCreate, AgentKnowledgeSourceCreate
+from typing import Annotated
 
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -49,6 +53,7 @@ app.add_middleware(
 
 credentials = AzureCliCredential()
 subscription_id = os.environ["AZURE_SUBSCRIPTION_ID"]
+user_object_id = os.environ["AZURE_USER_OBJECT_ID"]
 
 resource_client = ResourceManagementClient(credentials, subscription_id)
 consumption_client = ConsumptionManagementClient(credentials, subscription_id)
@@ -77,14 +82,14 @@ def get_openai_api_key(subscription_id, resource_group_name, resource_name):
     # Return the primary API key
     return keys.key1
 
-def deploy_openai_model(cognitive_client, resource_group_name, openai_resource_name, deployment_name, model_name):
+def deploy_openai_model(cognitive_client, resource_group_name, openai_resource_name, deployment_name, model_name, model_version):
     try:
         # Define the deployment model
         deployment_model = DeploymentModel(
-            name=model_name,       # Use the correct model name (e.g., 'gpt-4', 'gpt-35-turbo')
-            format='OpenAI',       # The format of the model
-            version='0613',        # Use the correct version (if required)
-            publisher='OpenAI'     # The publisher of the model
+            name=model_name,
+            format='OpenAI',
+            version=model_version,
+            publisher='OpenAI'
         )
 
         # Define the deployment properties
@@ -94,13 +99,13 @@ def deploy_openai_model(cognitive_client, resource_group_name, openai_resource_n
 
         # Define the SKU for the deployment
         deployment_sku = Sku(
-            name='Standard',  # Use the correct SKU name (e.g., 'Standard', 'Premium')
-            capacity=1        # Adjust capacity as needed
+            name='Standard',
+            capacity=1
         )
 
         # Define the deployment
         deployment = Deployment(
-            sku=deployment_sku,  # Use the SKU for scaling and capacity
+            sku=deployment_sku,
             properties=deployment_properties
         )
 
@@ -123,6 +128,45 @@ def deploy_openai_model(cognitive_client, resource_group_name, openai_resource_n
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+import asyncio
+from azure.mgmt.authorization import AuthorizationManagementClient
+from azure.mgmt.authorization.models import RoleAssignmentCreateParameters
+from uuid import uuid4
+
+def assign_storage_role_sync(resource_group_name, storage_account_name, principal_id):
+    """
+    Assigns 'Storage Blob Data Contributor' role to a given principal.
+    :param resource_group_name: Name of the Azure Resource Group
+    :param storage_account_name: Name of the Storage Account
+    :param principal_id: The Object ID of the user, service principal, or managed identity
+    """
+    # Define the role definition ID for 'Storage Blob Data Contributor'
+    role_definition_id = f"/subscriptions/{subscription_id}/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe"
+
+    # Get the storage account resource ID
+    storage_account = storage_client.storage_accounts.get_properties(resource_group_name, storage_account_name)
+    storage_account_id = storage_account.id
+
+    # Initialize the Authorization Management Client
+    auth_client = AuthorizationManagementClient(credentials, subscription_id)
+
+    # Generate a unique ID for the role assignment
+    role_assignment_id = str(uuid4())
+
+    # Create the role assignment parameters
+    assignment_params = RoleAssignmentCreateParameters(
+        role_definition_id=role_definition_id,
+        principal_id=principal_id
+    )
+
+    # Assign the role
+    auth_client.role_assignments.create(storage_account_id, role_assignment_id, assignment_params)
+    print(f"Role 'Storage Blob Data Contributor' assigned to {principal_id} on {storage_account_name}.")
+
+async def assign_storage_role(resource_group_name, storage_account_name, principal_id):
+    # Use asyncio.to_thread to run the blocking synchronous function in a separate thread
+    await asyncio.to_thread(assign_storage_role_sync, resource_group_name, storage_account_name, principal_id)
 
 @app.get("/")
 def read_root():
@@ -250,6 +294,7 @@ def new_agent(resource_group:ResourceGroup, db: Session = Depends(get_db)):
         openai_resource_name = f'agent{db_item.id}openai'
         deployment_name = f"gpt-3-deployment-agent{db_item.id}"
         model_name = "gpt-35-turbo"  # Replace with the correct model name
+        model_version = "0125"
 
         try:
             deployment_result = deploy_openai_model(
@@ -257,7 +302,8 @@ def new_agent(resource_group:ResourceGroup, db: Session = Depends(get_db)):
                 resource_group_name=rg_name,
                 openai_resource_name=openai_resource_name,
                 deployment_name=deployment_name,
-                model_name=model_name
+                model_name=model_name,
+                model_version=model_version
             )
 
             # Store the deployment details in the database
@@ -337,7 +383,16 @@ def delete_agent(id: int, db: Session = Depends(get_db)):
             resource_client.resource_groups.begin_delete(rg_name)
         except Exception as e:
             print(f"Warning: Failed to delete resource group {rg_name}. Error: {e}")
-        
+
+        # deleting corresponding records
+        agent_knowledge_source_item = db.query(AgentKnowledgeSource).filter(AgentKnowledgeSource.agent_id == id).all()
+        for item in agent_knowledge_source_item:
+            knowledge_source = db.query(KnowledgeSource).filter(KnowledgeSource.id == item.knowledge_id).first()
+            if (knowledge_source):
+                db.delete(knowledge_source)
+
+            db.delete(item)
+
         # deleting the record
         db.delete(db_item)
         db.commit()
@@ -366,3 +421,155 @@ def get_agent(agent_id: int, db: Session = Depends(get_db)):
         return { 'message': 'Success', 'agent': db_item, 'budget': db_item.budget, 'current_spend': current_spend}
     
     return HTTPException(404, { 'message': 'Error - agent was not found.' })
+
+@app.get('/agent/{agent_id}/get_knowledge_source/{knowledge_source_id}')
+def get_knowledge_source(agent_id: int, knowledge_source_id: int, db: Session = Depends(get_db)):
+    # Retrieve the agent from the database
+    current_agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not current_agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+    
+    # Retrieve the knowledge source from the database
+    knowledge_source = db.query(KnowledgeSource).filter(KnowledgeSource.id == knowledge_source_id).first()
+    if not knowledge_source:
+        raise HTTPException(status_code=404, detail="Knowledge source not found.")
+
+    try:
+        # Get the blob URL from the knowledge source
+        blob_url = knowledge_source.source
+        
+        # Get storage account credentials
+        resource_group_name = current_agent.name
+        storage_accounts = storage_client.storage_accounts.list_by_resource_group(resource_group_name)
+        storage_account = next(storage_accounts, None)
+        
+        if not storage_account:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"No storage accounts found in resource group '{resource_group_name}'."
+            )
+
+        # Get storage key
+        keys = storage_client.storage_accounts.list_keys(resource_group_name, storage_account.name)
+        storage_key = keys.keys[0].value
+
+        # Parse the blob URL to get container and blob names
+        parsed_url = urlparse(blob_url)
+        # Remove leading '/'
+        path_parts = parsed_url.path.lstrip('/').split('/')
+        container_name = path_parts[0]
+        blob_name = '/'.join(path_parts[1:])
+
+        # Create blob client directly from URL
+        blob_client = BlobClient.from_blob_url(
+            blob_url=blob_url,
+            credential=storage_key
+        )
+
+        # Download the blob
+        download_stream = blob_client.download_blob()
+        file_content = download_stream.readall()
+
+        # Create response headers
+        headers = {
+            "Content-Disposition": f"attachment; filename={blob_name}",
+            "Content-Type": "application/octet-stream"
+        }
+
+        # Return streaming response
+        return StreamingResponse(
+            BytesIO(file_content), 
+            media_type="application/octet-stream", 
+            headers=headers
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error downloading file: {str(e)}")
+
+@app.post('/agent/{agent_id}/add_knowledge_source')
+async def add_knowledge_source(agent_id: int, knowledge_source_name: str = Form(...), file: UploadFile = File(...), db: Session = Depends(get_db)):
+    # Retrieve the agent from the database
+    current_agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not current_agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    # Define the resource group and storage account details
+    resource_group_name = current_agent.name
+    container_name = f'agent{current_agent.id}-blob'
+
+    storage_accounts = storage_client.storage_accounts.list_by_resource_group(resource_group_name)
+
+    # Get the first storage account
+    storage_account = next(storage_accounts, None)
+    if not storage_account:
+        raise HTTPException(status_code=404, detail=f"No storage accounts found in resource group '{resource_group_name}'.")
+
+    try:
+        # Attempt to retrieve the storage account properties
+        storage_account = storage_client.storage_accounts.get_properties(
+            resource_group_name, storage_account.name
+        )
+        print(f"Storage account '{storage_account.name}' exists.")
+    except:
+        print(f"Storage account '{storage_account.name}' does not exist.")
+
+    # Initialize the BlobServiceClient
+    account_url = f'https://{storage_account.name}.blob.core.windows.net'
+
+    keys = storage_client.storage_accounts.list_keys(resource_group_name, storage_account.name)
+    storage_key = keys.keys[0].value
+
+    blob_service_client = BlobServiceClient(account_url=account_url, credential=storage_key)
+
+    # Get the container client
+    container_client = blob_service_client.get_container_client(container_name)
+
+    # Check if the container exists; if not, create it
+    if not container_client.exists():
+        container_client.create_container()
+        print(f"Container '{container_name}' created in storage account '{resource_group_name}'.")
+
+    # Get the blob client
+    blob_client = container_client.get_blob_client(file.filename)
+    
+    file_content = await file.read()
+
+    #await assign_storage_role(resource_group_name, container_name, user_object_id)
+
+    # Upload the file to the blob
+    try:
+        blob_client.upload_blob(file_content, overwrite=True, blob_type="BlockBlob")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error uploading file: {str(e)}")
+    
+    # adding record to database for knowledge source
+    db_knowledge_source = KnowledgeSource(name=knowledge_source_name, source=blob_client.url, approved=False)
+    db.add(db_knowledge_source)
+    db.flush()
+
+    db_knowledge_check = db.query(AgentKnowledgeSource).filter(AgentKnowledgeSource.agent_id == agent_id, AgentKnowledgeSource.knowledge_id == db_knowledge_source.id).first()
+    if (db_knowledge_check is None):
+        db_agent_knowledge_link = AgentKnowledgeSource(agent_id=agent_id, knowledge_id = db_knowledge_source.id)
+        db.add(db_agent_knowledge_link)
+    else:
+        raise HTTPException(status_code=500, detail='Error uploading file - knowledge source already exists in the database.')
+    
+    db.commit()
+
+    return {"message": f"File '{file.filename}' uploaded successfully to container '{container_name}'."}
+
+@app.get('/agent/{agent_id}/knowledge_sources')
+async def get_knowledge_sources_agent(agent_id: int, db: Session = Depends(get_db)):
+    db_item = db.query(AgentKnowledgeSource).filter(AgentKnowledgeSource.agent_id == agent_id).all()
+    if (db_item):
+        # returning all the knowledge sources
+        knowledge_sources = []
+
+        for item in db_item:
+            knowledge_source = db.query(KnowledgeSource).filter(KnowledgeSource.id == item.knowledge_id).first()
+            if (knowledge_source):
+                knowledge_sources.append(knowledge_source)
+
+        return { "message": "Success", "knowledge_sources": knowledge_sources }
+
+    return HTTPException(status_code=404, detail=f'Error - knowledge sources for agent {agent_id} not found.')
